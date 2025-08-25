@@ -388,7 +388,8 @@ def terminate_gcp_replica(name: str, zone: str, replica_id: int) -> str:
 @contextlib.contextmanager
 def override_sky_config(
     test: Optional[Test] = None,
-    env_dict: Optional[Dict[str, str]] = None
+    env_dict: Optional[Dict[str, str]] = None,
+    config_dict: Optional[Dict[str, Any]] = None,
 ) -> Generator[Optional[tempfile.NamedTemporaryFile], None, None]:
     echo = Test.echo_without_prefix if test is None else test.echo
     env_before_override: Optional[Dict[str, Any]] = None
@@ -397,6 +398,9 @@ def override_sky_config(
     if env_dict is None:
         env_dict = os.environ
         env_before_override = os.environ.copy()
+
+    if config_dict is not None:
+        override_sky_config_dict.update(config_dict)
 
     if is_remote_server_test():
         endpoint = docker_utils.get_api_server_endpoint_inside_docker()
@@ -448,9 +452,11 @@ def override_sky_config(
         os.environ.update(env_before_override)
 
 
-def run_one_test(test: Test) -> None:
+def run_one_test(test: Test, check_sky_status: bool = True) -> None:
     # Fail fast if `sky` CLI somehow errors out.
-    subprocess.run(['sky', 'status'], stdout=subprocess.DEVNULL, check=True)
+    if check_sky_status:
+        test.commands.insert(0, 'sky status')
+
     log_to_stdout = os.environ.get('LOG_TO_STDOUT', None)
     if log_to_stdout:
         write = test.echo
@@ -669,7 +675,8 @@ def launch_cluster_for_cloud_cmd(cloud: str, test_cluster_name: str) -> str:
 
 def run_cloud_cmd_on_cluster(test_cluster_name: str,
                              cmd: str,
-                             envs: Set[str] = None) -> str:
+                             envs: Set[str] = None,
+                             timeout: int = 180) -> str:
     """Run the cloud command on the remote cluster for cloud commands."""
     cluster_name = test_cluster_name + _CLOUD_CMD_CLUSTER_NAME_SUFFIX
     if sky.server.common.is_api_server_local() and not is_remote_server_test():
@@ -679,7 +686,7 @@ def run_cloud_cmd_on_cluster(test_cluster_name: str,
         wait_for_cluster_up = get_cmd_wait_until_cluster_status_contains(
             cluster_name=cluster_name,
             cluster_status=[sky.ClusterStatus.UP],
-            timeout=180,
+            timeout=timeout,
         )
         envs_str = ''
         if envs is not None:
@@ -799,7 +806,7 @@ def get_response_from_request_id(request_id: str) -> Any:
     request_task = None
     if response.status_code == 200:
         request_task = requests_lib.Request.decode(
-            requests_lib.RequestPayload(**response.json()))
+            payloads.RequestPayload(**response.json()))
         return request_task.get_return_value()
     raise RuntimeError(f'Failed to get request {request_id}: '
                        f'{response.status_code} {response.text}')
@@ -843,6 +850,12 @@ def server_side_is_consolidation_mode() -> bool:
     postgres. Here we manually retrieve the config from the server side to
     check if the consolidation mode is enabled.
     """
+    if is_remote_server_test():
+        # The buildkite pre_command setup does not affect the remote server
+        # config. So --postgres and --jobs-consolidation will not be enabled
+        # even if they are specified.
+        # (TODO: zeping) support this in the future.
+        return False
     response = requests.get(f'{get_api_server_url()}/workspaces/config')
     request_id = server_common.get_request_id(response)
     config = config_utils.Config.from_dict(sdk.get(request_id))

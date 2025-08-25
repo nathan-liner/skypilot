@@ -4,7 +4,6 @@ import argparse
 import asyncio
 import base64
 import contextlib
-import dataclasses
 import datetime
 import hashlib
 import json
@@ -14,10 +13,11 @@ import os
 import pathlib
 import posixpath
 import re
+import resource
 import shutil
 import sys
 import threading
-from typing import Any, Dict, List, Literal, Optional, Set, Tuple
+from typing import Dict, List, Literal, Optional, Set, Tuple
 import uuid
 import zipfile
 
@@ -26,6 +26,7 @@ import fastapi
 from fastapi.middleware import cors
 from passlib.hash import apr_md5_crypt
 import starlette.middleware.base
+import uvloop
 
 import sky
 from sky import catalog
@@ -41,13 +42,18 @@ from sky.data import storage_utils
 from sky.jobs.server import server as jobs_rest
 from sky.metrics import utils as metrics_utils
 from sky.provision.kubernetes import utils as kubernetes_utils
+from sky.schemas.api import responses
 from sky.serve.server import server as serve_rest
 from sky.server import common
 from sky.server import config as server_config
 from sky.server import constants as server_constants
+from sky.server import daemons
 from sky.server import metrics
 from sky.server import state
 from sky.server import stream_utils
+from sky.server import versions
+from sky.server.auth import authn
+from sky.server.auth import oauth2_proxy
 from sky.server.requests import executor
 from sky.server.requests import payloads
 from sky.server.requests import preconditions
@@ -115,41 +121,6 @@ def _basic_auth_401_response(content: str):
         status_code=401,
         headers={'WWW-Authenticate': 'Basic realm=\"SkyPilot\"'},
         content=content)
-
-
-# TODO(hailong): Remove this function and use request.state.auth_user instead.
-async def _override_user_info_in_request_body(request: fastapi.Request,
-                                              auth_user: Optional[models.User]):
-    if auth_user is None:
-        return
-
-    body = await request.body()
-    if body:
-        try:
-            original_json = await request.json()
-        except json.JSONDecodeError as e:
-            logger.error(f'Error parsing request JSON: {e}')
-        else:
-            logger.debug(f'Overriding user for {request.state.request_id}: '
-                         f'{auth_user.name}, {auth_user.id}')
-            if 'env_vars' in original_json:
-                if isinstance(original_json.get('env_vars'), dict):
-                    original_json['env_vars'][
-                        constants.USER_ID_ENV_VAR] = auth_user.id
-                    original_json['env_vars'][
-                        constants.USER_ENV_VAR] = auth_user.name
-                else:
-                    logger.warning(
-                        f'"env_vars" in request body is not a dictionary '
-                        f'for request {request.state.request_id}. '
-                        'Skipping user info injection into body.')
-            else:
-                original_json['env_vars'] = {}
-                original_json['env_vars'][
-                    constants.USER_ID_ENV_VAR] = auth_user.id
-                original_json['env_vars'][
-                    constants.USER_ENV_VAR] = auth_user.name
-            request._body = json.dumps(original_json).encode('utf-8')  # pylint: disable=protected-access
 
 
 def _try_set_basic_auth_user(request: fastapi.Request):
@@ -243,7 +214,7 @@ class BasicAuthMiddleware(starlette.middleware.base.BaseHTTPMiddleware):
     """Middleware to handle HTTP Basic Auth."""
 
     async def dispatch(self, request: fastapi.Request, call_next):
-        if request.url.path.startswith('/api/'):
+        if request.url.path.startswith('/api/health'):
             # Try to set the auth user from basic auth
             _try_set_basic_auth_user(request)
             return await call_next(request)
@@ -278,7 +249,7 @@ class BasicAuthMiddleware(starlette.middleware.base.BaseHTTPMiddleware):
                     apr_md5_crypt.verify(password, user.password)):
                 valid_user = True
                 request.state.auth_user = user
-                await _override_user_info_in_request_body(request, user)
+                await authn.override_user_info_in_request_body(request, user)
                 break
         if not valid_user:
             return _basic_auth_401_response('Invalid credentials')
@@ -397,7 +368,7 @@ class BearerTokenMiddleware(starlette.middleware.base.BaseHTTPMiddleware):
             request.state.auth_user = auth_user
 
             # Override user info in request body for service account requests
-            await _override_user_info_in_request_body(request, auth_user)
+            await authn.override_user_info_in_request_body(request, auth_user)
 
             logger.debug(f'Authenticated service account: {user_id}')
 
@@ -442,7 +413,7 @@ class AuthProxyMiddleware(starlette.middleware.base.BaseHTTPMiddleware):
         if auth_user is not None:
             request.state.auth_user = auth_user
 
-        await _override_user_info_in_request_body(request, auth_user)
+        await authn.override_user_info_in_request_body(request, auth_user)
         return await call_next(request)
 
 
@@ -480,7 +451,9 @@ async def lifespan(app: fastapi.FastAPI):  # pylint: disable=redefined-outer-nam
     """FastAPI lifespan context manager."""
     del app  # unused
     # Startup: Run background tasks
-    for event in requests_lib.INTERNAL_REQUEST_DAEMONS:
+    for event in daemons.INTERNAL_REQUEST_DAEMONS:
+        if event.should_skip():
+            continue
         try:
             executor.schedule_request(
                 request_id=event.id,
@@ -489,6 +462,9 @@ async def lifespan(app: fastapi.FastAPI):  # pylint: disable=redefined-outer-nam
                 func=event.run_event,
                 schedule_type=requests_lib.ScheduleType.SHORT,
                 is_skypilot_system=True,
+                # Request deamon should be retried if the process pool is
+                # broken.
+                retryable=True,
             )
         except exceptions.RequestAlreadyExistsError:
             # Lifespan will be executed in each uvicorn worker process, we
@@ -558,6 +534,35 @@ class GracefulShutdownMiddleware(starlette.middleware.base.BaseHTTPMiddleware):
         return await call_next(request)
 
 
+class APIVersionMiddleware(starlette.middleware.base.BaseHTTPMiddleware):
+    """Middleware to add API version to the request."""
+
+    async def dispatch(self, request: fastapi.Request, call_next):
+        version_info = versions.check_compatibility_at_server(request.headers)
+        # Bypass version handling for backward compatibility with clients prior
+        # to v0.11.0, the client will check the version in the body of
+        # /api/health response and hint an upgrade.
+        # TODO(aylei): remove this after v0.13.0 is released.
+        if version_info is None:
+            return await call_next(request)
+        if version_info.error is None:
+            versions.set_remote_api_version(version_info.api_version)
+            versions.set_remote_version(version_info.version)
+            response = await call_next(request)
+        else:
+            response = fastapi.responses.JSONResponse(
+                status_code=400,
+                content={
+                    'error': common.ApiServerStatus.VERSION_MISMATCH.value,
+                    'message': version_info.error,
+                })
+        response.headers[server_constants.API_VERSION_HEADER] = str(
+            server_constants.API_VERSION)
+        response.headers[server_constants.VERSION_HEADER] = \
+            versions.get_local_readable_version()
+        return response
+
+
 app = fastapi.FastAPI(prefix='/api/v1', debug=True, lifespan=lifespan)
 # Middleware wraps in the order defined here. E.g., given
 #   app.add_middleware(Middleware1)
@@ -570,6 +575,8 @@ app = fastapi.FastAPI(prefix='/api/v1', debug=True, lifespan=lifespan)
 # Use environment variable to make the metrics middleware optional.
 if os.environ.get(constants.ENV_VAR_SERVER_METRICS_ENABLED):
     app.add_middleware(metrics.PrometheusMiddleware)
+app.add_middleware(APIVersionMiddleware)
+app.add_middleware(RBACMiddleware)
 app.add_middleware(InternalDashboardPrefixMiddleware)
 app.add_middleware(GracefulShutdownMiddleware)
 app.add_middleware(PathCleanMiddleware)
@@ -588,6 +595,8 @@ app.add_middleware(
 # RBACMiddleware must precede all the auth middleware, so it can access
 # request.state.auth_user.
 app.add_middleware(RBACMiddleware)
+# Authentication based on oauth2-proxy.
+app.add_middleware(oauth2_proxy.OAuth2ProxyMiddleware)
 # AuthProxyMiddleware should precede BasicAuthMiddleware and
 # BearerTokenMiddleware, since it should be skipped if either of those set the
 # auth user.
@@ -613,6 +622,16 @@ app.include_router(volumes_rest.router, prefix='/volumes', tags=['volumes'])
 app.include_router(ssh_node_pools_rest.router,
                    prefix='/ssh_node_pools',
                    tags=['ssh_node_pools'])
+
+# Increase the limit of files we can open to our hard limit. This fixes bugs
+# where we can not aquire file locks or open enough logs and the API server
+# crashes. On Mac, the hard limit is 9,223,372,036,854,775,807.
+# TODO(luca) figure out what to do if we need to open more than 2^63 files.
+try:
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
+except Exception:  # pylint: disable=broad-except
+    pass  # no issue, we will warn the user later if its too low
 
 
 @app.get('/token')
@@ -773,15 +792,15 @@ async def validate(validate_body: payloads.ValidateBody) -> None:
     ctx.override_envs(validate_body.env_vars)
 
     def validate_dag(dag: dag_utils.dag_lib.Dag):
-        # Resolve the volumes before admin policy and validation.
-        dag.resolve_and_validate_volumes()
         # TODO: Admin policy may contain arbitrary code, which may be expensive
         # to run and may block the server thread. However, moving it into the
         # executor adds a ~150ms penalty on the local API server because of
         # added RTTs. For now, we stick to doing the validation inline in the
         # server thread.
         with admin_policy_utils.apply_and_use_config_in_current_request(
-                dag, request_options=validate_body.request_options) as dag:
+                dag,
+                request_options=validate_body.get_request_options()) as dag:
+            dag.resolve_and_validate_volumes()
             # Skip validating workdir and file_mounts, as those need to be
             # validated after the files are uploaded to the SkyPilot API server
             # with `upload_mounts_to_api_server`.
@@ -835,10 +854,15 @@ async def upload_zip_file(request: fastapi.Request, user_hash: str,
     upload_ids_to_cleanup[(upload_id,
                            user_hash)] = (datetime.datetime.now() +
                                           _DEFAULT_UPLOAD_EXPIRATION_TIME)
+    # For anonymous access, use the user hash from client
+    user_id = user_hash
+    if request.state.auth_user is not None:
+        # Otherwise, the authenticated identity should be used.
+        user_id = request.state.auth_user.id
 
     # TODO(SKY-1271): We need to double check security of uploading zip file.
     client_file_mounts_dir = (
-        common.API_SERVER_CLIENT_DIR.expanduser().resolve() / user_hash /
+        common.API_SERVER_CLIENT_DIR.expanduser().resolve() / user_id /
         'file_mounts')
     client_file_mounts_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1208,7 +1232,8 @@ async def download_logs(
 
 
 @app.post('/download')
-async def download(download_body: payloads.DownloadBody) -> None:
+async def download(download_body: payloads.DownloadBody,
+                   request: fastapi.Request) -> None:
     """Downloads a folder from the cluster to the local machine."""
     folder_paths = [
         pathlib.Path(folder_path) for folder_path in download_body.folder_paths
@@ -1237,7 +1262,16 @@ async def download(download_body: payloads.DownloadBody) -> None:
             str(folder_path.expanduser().resolve())
             for folder_path in folder_paths
         ]
-        storage_utils.zip_files_and_folders(folders, zip_path)
+        # Check for optional query parameter to control zip entry structure
+        relative = request.query_params.get('relative', 'home')
+        if relative == 'items':
+            # Dashboard-friendly: entries relative to selected folders
+            storage_utils.zip_files_and_folders(folders,
+                                                zip_path,
+                                                relative_to_items=True)
+        else:
+            # CLI-friendly (default): entries with full paths for mapping
+            storage_utils.zip_files_and_folders(folders, zip_path)
 
         # Add home path to the response headers, so that the client can replace
         # the remote path in the zip file to the local path.
@@ -1257,6 +1291,46 @@ async def download(download_body: payloads.DownloadBody) -> None:
     except Exception as e:
         raise fastapi.HTTPException(status_code=500,
                                     detail=f'Error creating zip file: {str(e)}')
+
+
+@app.post('/provision_logs')
+async def provision_logs(cluster_body: payloads.ClusterNameBody,
+                         follow: bool = True,
+                         tail: int = 0) -> fastapi.responses.StreamingResponse:
+    """Streams the provision.log for the latest launch request of a cluster."""
+    # Prefer clusters table first, then cluster_history as fallback.
+    log_path_str = global_user_state.get_cluster_provision_log_path(
+        cluster_body.cluster_name)
+    if not log_path_str:
+        log_path_str = global_user_state.get_cluster_history_provision_log_path(
+            cluster_body.cluster_name)
+    if not log_path_str:
+        raise fastapi.HTTPException(
+            status_code=404,
+            detail=('Provision log path is not recorded for this cluster. '
+                    'Please relaunch to generate provisioning logs.'))
+
+    log_path = pathlib.Path(log_path_str).expanduser().resolve()
+    if not log_path.exists():
+        raise fastapi.HTTPException(
+            status_code=404,
+            detail=f'Provision log path does not exist: {str(log_path)}')
+
+    # Tail semantics: 0 means print all lines. Convert 0 -> None for streamer.
+    effective_tail = None if tail is None or tail <= 0 else tail
+
+    return fastapi.responses.StreamingResponse(
+        content=stream_utils.log_streamer(None,
+                                          log_path,
+                                          tail=effective_tail,
+                                          follow=follow),
+        media_type='text/plain',
+        headers={
+            'Cache-Control': 'no-cache, no-transform',
+            'X-Accel-Buffering': 'no',
+            'Transfer-Encoding': 'chunked',
+        },
+    )
 
 
 @app.post('/cost_report')
@@ -1324,7 +1398,7 @@ async def local_down(request: fastapi.Request) -> None:
 
 # === API server related APIs ===
 @app.get('/api/get')
-async def api_get(request_id: str) -> requests_lib.RequestPayload:
+async def api_get(request_id: str) -> payloads.RequestPayload:
     """Gets a request with a given request ID prefix."""
     while True:
         request_task = requests_lib.get_request(request_id)
@@ -1339,9 +1413,8 @@ async def api_get(request_id: str) -> requests_lib.RequestPayload:
                     detail=f'Request {request_id!r} should be retried')
             request_error = request_task.get_error()
             if request_error is not None:
-                raise fastapi.HTTPException(status_code=500,
-                                            detail=dataclasses.asdict(
-                                                request_task.encode()))
+                raise fastapi.HTTPException(
+                    status_code=500, detail=request_task.encode().model_dump())
             return request_task.encode()
         # yield control to allow other coroutines to run, sleep shortly
         # to avoid storming the DB and CPU in the meantime
@@ -1420,6 +1493,12 @@ async def stream(
             raise fastapi.HTTPException(
                 status_code=404, detail=f'Request {request_id!r} not found')
         log_path_to_stream = request_task.log_path
+        if not log_path_to_stream.exists():
+            # The log file might be deleted by the request GC daemon but the
+            # request task is still in the database.
+            raise fastapi.HTTPException(
+                status_code=404,
+                detail=f'Log of request {request_id!r} has been deleted')
     else:
         assert log_path is not None, (request_id, log_path)
         if log_path == constants.API_SERVER_LOGS:
@@ -1479,7 +1558,7 @@ async def api_status(
         None, description='Request IDs to get status for.'),
     all_status: bool = fastapi.Query(
         False, description='Get finished requests as well.'),
-) -> List[requests_lib.RequestPayload]:
+) -> List[payloads.RequestPayload]:
     """Gets the list of requests."""
     if request_ids is None:
         statuses = None
@@ -1502,31 +1581,66 @@ async def api_status(
         return encoded_request_tasks
 
 
-@app.get('/api/health')
-async def health(request: fastapi.Request) -> Dict[str, Any]:
+@app.get(
+    '/api/health',
+    # response_model_exclude_unset omits unset fields
+    # in the response JSON.
+    response_model_exclude_unset=True)
+async def health(request: fastapi.Request) -> responses.APIHealthResponse:
     """Checks the health of the API server.
 
     Returns:
-        A dictionary with the following keys:
-        - status: str; The status of the API server.
-        - api_version: str; The API version of the API server.
-        - version: str; The version of SkyPilot used for API server.
-        - version_on_disk: str; The version of the SkyPilot installation on
-          disk, which can be used to warn about restarting the API server
-        - commit: str; The commit hash of SkyPilot used for API server.
+        responses.APIHealthResponse: The health response.
     """
     user = request.state.auth_user
-    logger.info(f'Health endpoint: request.state.auth_user = {user}')
-    return {
-        'status': common.ApiServerStatus.HEALTHY.value,
-        'api_version': server_constants.API_VERSION,
-        'version': sky.__version__,
-        'version_on_disk': common.get_skypilot_version_on_disk(),
-        'commit': sky.__commit__,
-        'user': user.to_dict() if user is not None else None,
-        'basic_auth_enabled': os.environ.get(
-            constants.ENV_VAR_ENABLE_BASIC_AUTH, 'false').lower() == 'true',
-    }
+    server_status = common.ApiServerStatus.HEALTHY
+    if getattr(request.state, 'anonymous_user', False):
+        # API server authentication is enabled, but the request is not
+        # authenticated. We still have to serve the request because the
+        # /api/health endpoint has two different usage:
+        # 1. For health check from `api start` and external ochestration
+        #    tools (k8s), which does not require authentication and user info.
+        # 2. Return server info to client and hint client to login if required.
+        # Separating these two usage to different APIs will break backward
+        # compatibility for existing ochestration solutions (e.g. helm chart).
+        # So we serve these two usages in a backward compatible manner below.
+        client_version = versions.get_remote_api_version()
+        # - For Client with API version >= 14, we return 200 response with
+        #   status=NEEDS_AUTH, new client will handle the login process.
+        # - For health check from `sky api start`, the client code always uses
+        #   the same API version with the server, thus there is no compatibility
+        #   issue.
+        server_status = common.ApiServerStatus.NEEDS_AUTH
+        if client_version is None:
+            # - For health check from ochestration tools (e.g. k8s), we also
+            #   return 200 with status=NEEDS_AUTH, which passes HTTP probe
+            #   check.
+            # - There is no harm when an malicious client calls /api/health
+            #   without authentication since no sensitive information is
+            #   returned.
+            return responses.APIHealthResponse(
+                status=common.ApiServerStatus.HEALTHY,)
+        # TODO(aylei): remove this after min_compatible_api_version >= 14.
+        if client_version < 14:
+            # For Client with API version < 14, the NEEDS_AUTH status is not
+            # honored. Return 401 to trigger the login process.
+            raise fastapi.HTTPException(status_code=401,
+                                        detail='Authentication required')
+
+    logger.debug(f'Health endpoint: request.state.auth_user = {user}')
+    return responses.APIHealthResponse(
+        status=server_status,
+        # Kept for backward compatibility, clients before 0.11.0 will read this
+        # field to check compatibility and hint the user to upgrade the CLI.
+        # TODO(aylei): remove this field after 0.13.0
+        api_version=str(server_constants.API_VERSION),
+        version=sky.__version__,
+        version_on_disk=common.get_skypilot_version_on_disk(),
+        commit=sky.__commit__,
+        basic_auth_enabled=os.environ.get(constants.ENV_VAR_ENABLE_BASIC_AUTH,
+                                          'false').lower() == 'true',
+        user=user if user is not None else None,
+    )
 
 
 @app.websocket('/kubernetes-pod-ssh-proxy')
@@ -1709,6 +1823,9 @@ if __name__ == '__main__':
 
     from sky.server import uvicorn as skyuvicorn
 
+    # Initialize global user state db
+    global_user_state.initialize_and_get_db()
+    # Initialize request db
     requests_lib.reset_db_and_logs()
 
     parser = argparse.ArgumentParser()
@@ -1731,13 +1848,21 @@ if __name__ == '__main__':
 
     queue_server: Optional[multiprocessing.Process] = None
     workers: List[executor.RequestWorker] = []
+    # Global background tasks that will be scheduled in a separate event loop.
+    global_tasks: List[asyncio.Task] = []
     try:
+        background = uvloop.new_event_loop()
         if os.environ.get(constants.ENV_VAR_SERVER_METRICS_ENABLED):
-            metrics_thread = threading.Thread(target=metrics.run_metrics_server,
-                                              args=(cmd_args.host,
-                                                    cmd_args.metrics_port),
-                                              daemon=True)
-            metrics_thread.start()
+            metrics_server = metrics.build_metrics_server(
+                cmd_args.host, cmd_args.metrics_port)
+            global_tasks.append(background.create_task(metrics_server.serve()))
+        global_tasks.append(
+            background.create_task(requests_lib.requests_gc_daemon()))
+        global_tasks.append(
+            background.create_task(
+                global_user_state.cluster_event_retention_daemon()))
+        threading.Thread(target=background.run_forever, daemon=True).start()
+
         queue_server, workers = executor.start(config)
 
         logger.info(f'Starting SkyPilot API server, workers={num_workers}')
@@ -1755,6 +1880,8 @@ if __name__ == '__main__':
     finally:
         logger.info('Shutting down SkyPilot API server...')
 
+        for gt in global_tasks:
+            gt.cancel()
         subprocess_utils.run_in_parallel(lambda worker: worker.cancel(),
                                          workers,
                                          num_threads=len(workers))

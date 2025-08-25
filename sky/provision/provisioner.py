@@ -22,11 +22,13 @@ from sky import sky_logging
 from sky import skypilot_config
 from sky.adaptors import aws
 from sky.backends import backend_utils
+from sky.jobs.server import utils as server_jobs_utils
 from sky.provision import common as provision_common
 from sky.provision import instance_setup
 from sky.provision import logging as provision_logging
 from sky.provision import metadata_utils
 from sky.skylet import constants
+from sky.utils import common
 from sky.utils import common_utils
 from sky.utils import message_utils
 from sky.utils import resources_utils
@@ -74,7 +76,8 @@ def _bulk_provision(
     logger.debug(f'\nWaiting for instances of {cluster_name!r} to be ready...')
     rich_utils.force_update_status(
         ux_utils.spinner_message('Launching - Checking instance status',
-                                 str(provision_logging.config.log_path)))
+                                 str(provision_logging.config.log_path),
+                                 cluster_name=str(cluster_name)))
     # AWS would take a very short time (<<1s) updating the state of the
     # instance.
     time.sleep(1)
@@ -97,6 +100,12 @@ def _bulk_provision(
     logger.debug(
         f'\nProvisioning {cluster_name!r} took {time.time() - start:.2f} '
         f'seconds.')
+
+    # Add cluster event for provisioning completion.
+    global_user_state.add_cluster_event(
+        str(cluster_name), status_lib.ClusterStatus.INIT,
+        f'Instances launched on {cloud.display_name()} in {region}',
+        global_user_state.ClusterEventType.STATUS_CHANGE)
 
     return provision_record
 
@@ -454,9 +463,9 @@ def _post_provision_setup(
     docker_config = config_from_yaml.get('docker', {})
 
     with rich_utils.safe_status(
-            ux_utils.spinner_message(
-                'Launching - Waiting for SSH access',
-                provision_logging.config.log_path)) as status:
+            ux_utils.spinner_message('Launching - Waiting for SSH access',
+                                     provision_logging.config.log_path,
+                                     cluster_name=str(cluster_name))) as status:
         # If on Kubernetes, skip SSH check since the pods are guaranteed to be
         # ready by the provisioner, and we use kubectl instead of SSH to run the
         # commands and rsync on the pods. SSH will still be ready after a while
@@ -485,7 +494,8 @@ def _post_provision_setup(
             status.update(
                 ux_utils.spinner_message(
                     'Launching - Initializing docker container',
-                    provision_logging.config.log_path))
+                    provision_logging.config.log_path,
+                    cluster_name=str(cluster_name)))
             docker_user = instance_setup.initialize_docker(
                 cluster_name.name_on_cloud,
                 docker_config=docker_config,
@@ -502,6 +512,24 @@ def _post_provision_setup(
             logger.info(f'{ux_utils.INDENT_LAST_SYMBOL}{colorama.Style.DIM}'
                         f'Docker container is up.{colorama.Style.RESET_ALL}')
 
+        # Check version compatibility for jobs controller clusters
+        if cluster_name.display_name.startswith(common.JOB_CONTROLLER_PREFIX):
+            # TODO(zeping): remove this in v0.12.0
+            # This only happens in upgrade from <0.9.3 to > 0.10.0
+            # After 0.10.0 no incompatibility issue
+            # See https://github.com/skypilot-org/skypilot/pull/6096
+            # For more details
+            status.update(
+                ux_utils.spinner_message(
+                    'Checking controller version compatibility'))
+            try:
+                server_jobs_utils.check_version_mismatch_and_non_terminal_jobs()
+            except exceptions.ClusterNotUpError:
+                # Controller is not up yet during initial provisioning, that
+                # also means no non-terminal jobs, so no incompatibility in
+                # this case.
+                pass
+
         # We mount the metadata with sky wheel for speedup.
         # NOTE: currently we mount all credentials for all nodes, because
         # (1) jobs controllers need permission to launch/down nodes of
@@ -515,7 +543,8 @@ def _post_provision_setup(
 
         runtime_preparation_str = (ux_utils.spinner_message(
             'Preparing SkyPilot runtime ({step}/3 - {step_name})',
-            provision_logging.config.log_path))
+            provision_logging.config.log_path,
+            cluster_name=str(cluster_name)))
         status.update(
             runtime_preparation_str.format(step=1, step_name='initializing'))
         instance_setup.internal_file_mounts(cluster_name.name_on_cloud,
@@ -653,7 +682,8 @@ def _post_provision_setup(
         if logging_agent:
             status.update(
                 ux_utils.spinner_message('Setting up logging agent',
-                                         provision_logging.config.log_path))
+                                         provision_logging.config.log_path,
+                                         cluster_name=str(cluster_name)))
             instance_setup.setup_logging_on_cluster(logging_agent, cluster_name,
                                                     cluster_info,
                                                     ssh_credentials)
@@ -663,7 +693,8 @@ def _post_provision_setup(
 
     logger.info(
         ux_utils.finishing_message(f'Cluster launched: {cluster_name}.',
-                                   provision_logging.config.log_path))
+                                   provision_logging.config.log_path,
+                                   cluster_name=str(cluster_name)))
     return cluster_info
 
 

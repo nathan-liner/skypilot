@@ -35,20 +35,28 @@ def fetch_master_api_version() -> str:
     with urllib.request.urlopen(MASTER_CONSTANTS_URL) as response:
         master_content = response.read().decode('utf-8')
 
+    return parse_api_version(master_content)
+
+
+def parse_api_version(content: str) -> str:
+    """Parse the API version from the content."""
     # Extract API_VERSION using regex
-    # Matches: API_VERSION = 'value' (pylint enforced format)
-    pattern = r"API_VERSION = '([^']+)'"
-    match = re.search(pattern, master_content)
+    # Matches: API_VERSION = value (pylint enforced format)
+    pattern = r"API_VERSION\s=\s(\d+)"
+    match = re.search(pattern, content)
 
     if match:
         return match.group(1)
     else:
-        raise ValueError("API_VERSION not found in master constants.py")
+        raise ValueError("API_VERSION not found in constants.py")
 
 
 def check_api_version_compatibility() -> bool:
     """Check if current and master API versions match."""
-    current_version = current_constants.API_VERSION
+    # Parse instead of read the constants directly to avoid regression breaking
+    # the test when the format on PR branch is changed.
+    current_content = inspect.getsource(current_constants)
+    current_version = parse_api_version(current_content)
     master_version = fetch_master_api_version()
 
     return current_version == master_version
@@ -104,10 +112,12 @@ def get_field_info(model_class: Type) -> Dict[str, Dict[str, Any]]:
 def compare_field_types(type1: Any, type2: Any) -> bool:
     """Compare two type annotations for compatibility."""
     # Handle Optional types
+    # For Optional[Union[typea, typeb]], we need to compare the union types
+    # in set to avoid order dependency.
     if get_origin(type1) is Union and type(None) in get_args(type1):
-        type1 = next(arg for arg in get_args(type1) if arg is not type(None))
+        type1 = set(arg for arg in get_args(type1) if arg is not type(None))
     if get_origin(type2) is Union and type(None) in get_args(type2):
-        type2 = next(arg for arg in get_args(type2) if arg is not type(None))
+        type2 = set(arg for arg in get_args(type2) if arg is not type(None))
 
     # Handle List types
     if get_origin(type1) is list:

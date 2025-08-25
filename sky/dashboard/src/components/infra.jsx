@@ -1450,14 +1450,18 @@ export function GPUs() {
 
   const fetchData = React.useCallback(
     async (options = { showLoadingIndicators: true }) => {
-      if (options.showLoadingIndicators) {
+      const { showLoadingIndicators = true, forceRefresh = false } = options;
+      if (showLoadingIndicators) {
         setKubeLoading(true);
         setCloudLoading(true);
       }
 
       try {
         // Use the shared getInfraData function
-        const infraData = await dashboardCache.get(getInfraData);
+        // If forceRefresh is true, call getInfraData directly to bypass cache
+        const infraData = forceRefresh
+          ? await getInfraData(true)
+          : await dashboardCache.get(getInfraData);
 
         const { gpuData, cloudData } = infraData || {};
 
@@ -1525,13 +1529,13 @@ export function GPUs() {
       } finally {
         // Always clear loading states when showLoadingIndicators is true
         // This prevents infinite loading state
-        if (options.showLoadingIndicators) {
+        if (showLoadingIndicators) {
           setKubeLoading(false);
           setCloudLoading(false);
         }
 
         // Set isInitialLoad to false only after the first fetch cycle initiated with showLoadingIndicators:true
-        if (isInitialLoad && options.showLoadingIndicators) {
+        if (isInitialLoad && showLoadingIndicators) {
           setIsInitialLoad(false);
         }
       }
@@ -1659,9 +1663,29 @@ export function GPUs() {
     dashboardCache.invalidate(getInfraData);
 
     if (refreshDataRef.current) {
-      refreshDataRef.current({ showLoadingIndicators: true });
+      refreshDataRef.current({
+        showLoadingIndicators: true,
+        forceRefresh: true, // Force refresh to run sky check
+      });
     }
   };
+
+  // Effect for keyboard shortcut (Cmd+R / Ctrl+R) to force refresh
+  useEffect(() => {
+    const handleKeyDown = (event) => {
+      // Check for Cmd+R (Mac) or Ctrl+R (Windows/Linux)
+      if ((event.metaKey || event.ctrlKey) && event.key === 'r') {
+        event.preventDefault(); // Prevent browser refresh
+        handleRefresh(); // Trigger our force refresh
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+    };
+  }, []);
 
   // Calculate summary data
   const totalGpuTypes = (allGPUs || []).length;
@@ -1961,16 +1985,69 @@ export function GPUs() {
       return renderContextDetails(selectedContext);
     }
 
+    // Dynamically determine section order based on current data availability
+    // Sections will reorder automatically as data becomes ready
+    const sections = [];
+
+    // Helper function to check if contexts have activity
+    const hasContextActivity = (contexts, isSSH = false) => {
+      return contexts.some((context) => {
+        const contextKey = isSSH
+          ? `ssh/${context.replace(/^ssh-/, '')}`
+          : `kubernetes/${context}`;
+        const stats = contextStats[contextKey] || { clusters: 0, jobs: 0 };
+        return stats.clusters > 0 || stats.jobs > 0;
+      });
+    };
+
+    // Always add all three sections (they handle their own loading/empty states)
+
+    // Add Kubernetes section (always show)
+    // Kubernetes section is active if there are any contexts available (similar to Cloud logic)
+    const kubeHasActivity = kubeContexts.length > 0;
+    sections.push({
+      name: 'Kubernetes',
+      render: renderKubernetesInfrastructure,
+      hasActivity: kubeHasActivity,
+      priority: 1, // Kubernetes gets priority 1 within same activity level
+    });
+
+    // Add Cloud section (always show)
+    // Cloud section is active if there are any enabled clouds
+    const cloudHasActivity = enabledClouds > 0;
+    sections.push({
+      name: 'Cloud',
+      render: renderCloudInfrastructure,
+      hasActivity: cloudHasActivity,
+      priority: 2, // Cloud gets priority 2 within same activity level
+    });
+
+    // Add SSH section (always show)
+    const sshHasActivity =
+      sshContexts.length > 0 && hasContextActivity(sshContexts, true);
+    sections.push({
+      name: 'SSH Node Pool',
+      render: renderSSHNodePoolInfrastructure,
+      hasActivity: sshHasActivity,
+      priority: 3, // SSH gets priority 3 within same activity level
+    });
+
+    // Dynamic sorting: enabled/active sections move to front automatically
+    // This re-sorts every render as data becomes available
+    const sortedSections = sections.sort((a, b) => {
+      // Primary sort: active sections come first (this causes dynamic reordering)
+      if (a.hasActivity !== b.hasActivity) {
+        return a.hasActivity ? -1 : 1; // active sections move to front
+      }
+      // Secondary sort: maintain consistent order within same activity level
+      return a.priority - b.priority;
+    });
+
     return (
       <>
-        {/* Show SSH Node Pool Infrastructure first */}
-        {renderSSHNodePoolInfrastructure()}
-
-        {/* Show Kubernetes Infrastructure second */}
-        {renderKubernetesInfrastructure()}
-
-        {/* Then show Cloud Infrastructure */}
-        {renderCloudInfrastructure()}
+        {sortedSections.map((section, index) => (
+          <React.Fragment key={index}>{section.render()}</React.Fragment>
+        ))}
       </>
     );
   };

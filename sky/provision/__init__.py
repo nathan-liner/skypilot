@@ -73,13 +73,15 @@ def _route_to_cloud_impl(func):
 @_route_to_cloud_impl
 def query_instances(
     provider_name: str,
+    cluster_name: str,
     cluster_name_on_cloud: str,
     provider_config: Optional[Dict[str, Any]] = None,
     non_terminated_only: bool = True,
-) -> Dict[str, Optional['status_lib.ClusterStatus']]:
+) -> Dict[str, Tuple[Optional['status_lib.ClusterStatus'], Optional[str]]]:
     """Query instances.
 
-    Returns a dictionary of instance IDs and status.
+    Returns a dictionary of instance IDs and a tuple of (status, reason for
+    being in status if any).
 
     A None status means the instance is marked as "terminated"
     or "terminating".
@@ -163,6 +165,17 @@ def terminate_instances(
     worker_only: bool = False,
 ) -> None:
     """Terminate running or stopped instances."""
+    raise NotImplementedError
+
+
+@_route_to_cloud_impl
+def cleanup_custom_multi_network(
+    provider_name: str,
+    cluster_name_on_cloud: str,
+    provider_config: Dict[str, Any],
+    failover: bool = False,
+) -> None:
+    """Cleanup custom multi-network."""
     raise NotImplementedError
 
 

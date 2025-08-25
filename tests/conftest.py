@@ -1,13 +1,18 @@
 import fcntl
 import json
 import os
+import pathlib
+import signal
+import socket
 import subprocess
 import tempfile
 import time
-from typing import List
+from typing import Any, Dict, List, Optional
 
+import filelock
 import pytest
 import requests
+from smoke_tests import smoke_tests_utils
 from smoke_tests.docker import docker_utils
 from sqlalchemy import exc as sqlalchemy_exc
 from sqlalchemy import orm
@@ -16,6 +21,9 @@ import sqlalchemy_adapter
 
 from sky import global_user_state
 from sky import sky_logging
+from sky import skypilot_config
+from sky.skylet import constants
+from sky.utils import common_utils
 
 # Initialize logger at the top level
 logger = sky_logging.init_logger(__name__)
@@ -196,6 +204,18 @@ def pytest_configure(config):
         config.addinivalue_line(
             'markers', f'{cloud_keyword}: mark test as {cloud} specific')
 
+    # Validate incompatible option combinations
+    if config.getoption('--remote-server'):
+        if config.getoption('--jobs-consolidation'):
+            raise ValueError(
+                '--remote-server and --jobs-consolidation are not compatible. '
+                'Jobs consolidation mode is not supported with remote server testing.'
+            )
+        if config.getoption('--postgres'):
+            raise ValueError(
+                '--remote-server and --postgres are not compatible. '
+                'Postgres backend is not supported with remote server testing.')
+
     pytest.terminate_on_failure = config.getoption('--terminate-on-failure')
 
 
@@ -327,6 +347,96 @@ def _generic_cloud(config) -> str:
 @pytest.fixture
 def generic_cloud(request) -> str:
     return _generic_cloud(request.config)
+
+
+@pytest.fixture(scope='session', autouse=True)
+def setup_policy_server(request, tmp_path_factory):
+    """Setup policy server for restful policy testing."""
+    # TODO(aylei): this is a common pattern to launch global instance before
+    # test suite and cleanup after the suite, abstract this out if needed.
+    if request.config.getoption('--remote-server'):
+        # For remote server, the policy server should be accessible from the
+        # remote server host. Left as future work.
+        # TODO(aylei): support remote server with restful policy.
+        yield
+        return
+
+    has_smoke_tests = False
+    has_backward_compat_test = False
+    if hasattr(request.session, 'items'):
+        has_smoke_tests = any(
+            'smoke_tests' in item.location[0] for item in request.session.items)
+        has_backward_compat_test = any('backward_compat' in item.location[0]
+                                       for item in request.session.items)
+
+    # Only run the policy server for smoke tests and skip backward compatibility tests.
+    if not has_smoke_tests or has_backward_compat_test:
+        yield
+        return
+
+    # get the temp directory shared by all workers
+    root_tmp_dir = tmp_path_factory.getbasetemp().parent
+
+    fn = root_tmp_dir / 'policy_server.txt'
+    policy_server_url = ''
+    # Reference count and pid for cleanup
+    counter_file = root_tmp_dir / 'policy_server_counter.txt'
+    pid_file = root_tmp_dir / 'policy_server_pid.txt'
+
+    def ref_count(delta: int) -> int:
+        try:
+            with open(counter_file, 'r', encoding='utf-8') as f:
+                count = int(f.read().strip())
+        except (FileNotFoundError, ValueError):
+            count = 0
+        count += delta
+        with open(counter_file, 'w', encoding='utf-8') as f:
+            f.write(str(count))
+        return count
+
+    def wait_server(port: int, timeout: int = 60):
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            try:
+                socket.create_connection(('127.0.0.1', port), timeout=1).close()
+                return True
+            except (socket.error, OSError):
+                time.sleep(0.5)
+        raise RuntimeError(f"Policy server not available after {timeout}s")
+
+    try:
+        policy_server_url: Optional[str] = None
+        with filelock.FileLock(str(fn) + ".lock"):
+            if fn.is_file():
+                ref_count(1)
+                policy_server_url = fn.read_text().strip()
+            else:
+                # Launch the policy server
+                port = common_utils.find_free_port(start_port=10000)
+                policy_server_url = f'http://127.0.0.1:{port}'
+                server_process = subprocess.Popen([
+                    'python', 'tests/admin_policy/no_op_server.py', '--host',
+                    '0.0.0.0', '--port',
+                    str(port)
+                ])
+                wait_server(port)
+                pid_file.write_text(str(server_process.pid))
+                fn.write_text(policy_server_url)
+                ref_count(1)
+        if policy_server_url is not None:
+            with smoke_tests_utils.override_sky_config(
+                    config_dict={'admin_policy': policy_server_url}):
+                yield
+        else:
+            yield
+    finally:
+        with filelock.FileLock(str(fn) + ".lock"):
+            count = ref_count(-1)
+            if count == 0:
+                # All workers are done, run post cleanup.
+                pid = pid_file.read_text().strip()
+                if pid:
+                    os.kill(int(pid), signal.SIGKILL)
 
 
 @pytest.fixture(scope='session', autouse=True)
@@ -516,69 +626,4 @@ def setup_postgres_backend_env(request):
         yield
         return
     os.environ['PYTEST_SKYPILOT_POSTGRES_BACKEND'] = '1'
-    yield
-
-
-@pytest.fixture(autouse=True)
-def patch_db_create_for_parallel_tests(monkeypatch):
-    """Mock Base.metadata.create_all with file lock to prevent race conditions in parallel execution."""
-
-    # Store the original create_all method
-    original_create_all = global_user_state.Base.metadata.create_all
-
-    def create_all_with_lock(bind=None, **kwargs):
-        """Wrapper for Base.metadata.create_all with file lock to prevent race conditions."""
-        # Use file lock to ensure only one process creates tables at a time
-        # Use a constant path in ~/.sky so all test processes can see the same lock file
-        lock_file_path = os.path.expanduser('~/.sky/test_db_create_all.lock')
-
-        with open(lock_file_path, 'w') as lock_file:
-            try:
-                # Acquire exclusive lock - blocks other processes until we're done
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-
-                # Create all tables - the lock prevents race conditions during table creation
-                # SQLAlchemy's create_all() handles existing tables gracefully with checkfirst=True
-                original_create_all(bind=bind, **kwargs)
-
-            finally:
-                # Lock is automatically released when file is closed
-                pass
-
-    # Patch the method
-    monkeypatch.setattr(global_user_state.Base.metadata, 'create_all',
-                        create_all_with_lock)
-
-    yield
-
-
-@pytest.fixture(autouse=True)
-def patch_casbin_adapter_for_parallel_tests(monkeypatch):
-    """Mock Casbin SQLAlchemy Adapter initialization with file lock to prevent race conditions in parallel execution."""
-
-    # Store the original Adapter class
-    original_adapter_init = sqlalchemy_adapter.Adapter.__init__
-
-    def adapter_init_with_lock(self, engine, *args, **kwargs):
-        """Wrapper for sqlalchemy_adapter.Adapter.__init__ with file lock to prevent race conditions."""
-        # Use file lock to ensure only one process creates casbin tables at a time
-        # Use a constant path in ~/.sky so all test processes can see the same lock file
-        lock_file_path = os.path.expanduser('~/.sky/test_casbin_adapter.lock')
-
-        with open(lock_file_path, 'w') as lock_file:
-            try:
-                # Acquire exclusive lock - blocks other processes until we're done
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-
-                # Initialize the adapter - the lock prevents race conditions during table creation
-                original_adapter_init(self, engine, *args, **kwargs)
-
-            finally:
-                # Lock is automatically released when file is closed
-                pass
-
-    # Patch the method
-    monkeypatch.setattr(sqlalchemy_adapter.Adapter, '__init__',
-                        adapter_init_with_lock)
-
     yield

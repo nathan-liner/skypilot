@@ -46,7 +46,9 @@ Below is the configuration syntax and some example values.  See details under ea
     :ref:`ports <yaml-spec-resources-ports>`: 8081
     :ref:`labels <yaml-spec-resources-labels>`:
       my-label: my-value
-    :ref:`autostop <yaml-spec-resources-autostop>`: 10m
+    :ref:`autostop <yaml-spec-resources-autostop>`:
+      idle_minutes: 10
+      wait_for: none
 
     :ref:`any_of <yaml-spec-resources-any-of>`:
       - infra: aws/us-west-2
@@ -134,13 +136,40 @@ Task name (optional), used for display purposes.
 ``workdir``
 ~~~~~~~~~~~
 
-Working directory (optional), synced to ``~/sky_workdir`` on the remote cluster each time launch or exec is run with the yaml file.
+``workdir`` can be a local working directory or a git repository (optional). It is synced or cloned to ``~/sky_workdir`` on the remote cluster each time ``sky launch`` or ``sky exec`` is run with the YAML file.
 
-Commands in ``setup`` and ``run`` will be executed under it.
+**Local Directory**:
+
+If ``workdir`` is a local path, the entire directory is synced to the remote cluster. To exclude files from syncing, see :ref:`exclude-uploading-files`.
 
 If a relative path is used, it's evaluated relative to the location from which ``sky`` is called.
 
-To exclude files from syncing, see https://docs.skypilot.co/en/latest/examples/syncing-code-artifacts.html#exclude-uploading-files
+**Git Repository**:
+
+If ``workdir`` is a git repository, the ``url`` field is required and can be in one of the following formats:
+
+* HTTPS: ``https://github.com/skypilot-org/skypilot.git``
+* SSH: ``ssh://git@github.com/skypilot-org/skypilot.git``
+* SCP: ``git@github.com:skypilot-org/skypilot.git``
+
+The ``ref`` field specifies the git reference to checkout, which can be:
+
+* A branch name (e.g., ``main``, ``develop``)
+* A tag name (e.g., ``v1.0.0``)
+* A commit hash (e.g., ``abc123def456``)
+
+**Authentication for Private Repositories**:
+
+*For HTTPS URLs*: Set the ``GIT_TOKEN`` environment variable. SkyPilot will automatically use this token for authentication.
+
+*For SSH/SCP URLs*: SkyPilot will attempt to authenticate using SSH keys in the following order:
+
+1. SSH key specified by the ``GIT_SSH_KEY_PATH`` environment variable
+2. SSH key configured in ``~/.ssh/config`` for the git host
+3. Default SSH key at ``~/.ssh/id_rsa``
+4. Default SSH key at ``~/.ssh/id_ed25519`` (if ``~/.ssh/id_rsa`` does not exist)
+
+Commands in ``setup`` and ``run`` will be executed under ``~/sky_workdir``.
 
 .. code-block:: yaml
 
@@ -152,6 +181,13 @@ OR
 
   workdir: ../my-project  # Relative path
 
+OR
+
+.. code-block:: yaml
+
+  workdir:
+    url: https://github.com/skypilot-org/skypilot.git
+    ref: main
 
 .. _yaml-spec-num-nodes:
 
@@ -243,8 +279,15 @@ Format:
 - ``<num>``: Stop after this many idle minutes
 - ``<num><unit>``: Stop after this much time
 - Object with configuration:
+
   - ``idle_minutes``: Number of idle minutes before stopping
   - ``down``: If true, tear down the cluster instead of stopping it
+  - ``wait_for``: Determines the condition for resetting the idleness timer.
+    Options:
+
+    - ``jobs_and_ssh`` (default): Wait for in‑progress jobs and SSH connections to finish
+    - ``jobs``: Only wait for in‑progress jobs
+    - ``none``: Wait for nothing; autostop right after ``idle_minutes``
 
 ``<unit>`` can be one of:
 - ``m``: minutes (default if not specified)
@@ -282,6 +325,15 @@ OR
     autostop:
       idle_minutes: 10
       down: true  # Use autodown instead of autostop
+
+OR
+
+.. code-block:: yaml
+
+  resources:
+    autostop:
+      idle_minutes: 10
+      wait_for: none  # Stop after 10 minutes, regardless of running jobs or SSH connections
 
 
 .. _yaml-spec-resources-accelerators:
@@ -492,7 +544,7 @@ Units supported (case-insensitive):
 
   resources:
     disk_size: 256
-  
+
 OR
 
 .. code-block:: yaml
@@ -546,7 +598,8 @@ If ``'best'`` is specified, use the best network tier available on the specified
 
 - ``infra: gcp``: Enable GPUDirect-TCPX for high-performance node-to-node GPU communication
 - ``infra: nebius``: Enable Infiniband for high-performance GPU communication across Nebius VMs
-- ``infra: k8s/my-nebius-cluster``: Enable InfiniBand for high-performance GPU communication across pods on Nebius managed Kubernetes.
+- ``infra: k8s/my-nebius-cluster``: Enable InfiniBand for high-performance GPU communication across pods on Nebius managed Kubernetes
+- ``infra: k8s/my-gke-cluster``: Enable GPUDirect-TCPX/TCPXO/RDMA for high-performance GPU communication across pods on Google Kubernetes Engine (GKE).
 
 .. code-block:: yaml
 

@@ -24,6 +24,9 @@ from sky.provision.aws import config as aws_config
 from sky.provision.kubernetes import utils as kubernetes_utils
 from sky.serve import serve_state
 from sky.server import common as server_common
+from sky.server import constants as server_constants
+from sky.server import rest
+from sky.server import versions
 from sky.server.requests import executor
 from sky.server.requests import requests as api_requests
 from sky.server.server import app
@@ -109,12 +112,16 @@ def mock_client_requests(monkeypatch: pytest.MonkeyPatch, mock_queue,
                 # Add iter_content method to response
                 response.iter_content = iter_content
 
+            response.headers[server_constants.API_VERSION_HEADER] = str(
+                server_constants.API_VERSION)
+            response.headers[server_constants.VERSION_HEADER] = \
+                versions.get_local_readable_version()
             return response
         else:
             return original_func(url, *args, **kwargs)
 
-    # Use monkeypatch to replace `requests.post` and `requests.get`
-    monkeypatch.setattr(requests, 'request', mock_http_request)
+    # pylint: disable=protected-access
+    monkeypatch.setattr(rest._session, "request", mock_http_request)
 
 
 # Define helper functions at module level for pickleability
@@ -247,7 +254,12 @@ def mock_job_table_no_job(monkeypatch):
 def mock_job_table_one_job(monkeypatch):
     """Mock job table to return one job."""
 
-    def mock_get_job_table(*_, **__):
+    def mock_get_job_table(*args, **__):
+        # The third argument is the cmd.
+        cmd = args[2]
+        # Return no pools for the job table.
+        if 'get_service_status_encoded' in cmd:
+            return 0, message_utils.encode_payload([]), ''
         current_time = time.time()
         job_data = {
             'job_id': '1',
@@ -267,6 +279,10 @@ def mock_job_table_one_job(monkeypatch):
             'task_name': 'test_task',
             'job_duration': 20,
             'priority': constants.DEFAULT_PRIORITY,
+            'pool': None,
+            'current_cluster_name': None,
+            'job_id_on_pool_cluster': None,
+            'pool_hash': None,
         }
         return 0, message_utils.encode_payload([job_data]), ''
 
